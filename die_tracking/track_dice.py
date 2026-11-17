@@ -123,15 +123,16 @@ def die_blob_area(frame, bounds, clusters=3, work_size=64):
 
 
 def measure_die_area(frame, box_area, bounds, tolerance=1.2):
-    """Return ``(area, source)`` for one die.
+    """Return ``(box_area, blob_area, source)`` for one die.
 
-    Use the blob area unless it is missing, empty, or larger than ``tolerance`` times
-    the YOLO box area. In those cases return the box area. ``source`` is "blob" or "box".
+    ``blob_area`` is None if it could not be measured. ``source`` is the estimate
+    in use: "blob" unless the blob is missing, empty, or larger than ``tolerance``
+    times the YOLO box area, in which case it is "box".
     """
     blob = die_blob_area(frame, bounds)
     if blob is None or blob == 0 or blob > tolerance * box_area:
-        return box_area, "box"
-    return blob, "blob"
+        return box_area, blob, "box"
+    return box_area, blob, "blob"
 
 def close_resources(camera, writer):
     """Optional video resources, camera, display windows, and debug logs."""
@@ -311,16 +312,15 @@ def main():
             cv2.putText(frame, "forward: {:.2f}  right: {:.2f} m/s".format(forward_speed, right_speed), (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.putText(frame, error_text, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if aligned else (0, 0, 255), 2)
             
-            for index, ((die_px, source), candidate) in enumerate(zip(die_areas, candidates)):
-                cv2.putText(
-                    frame,
-                    "{} area: {} px ({})".format(candidate[3], int(die_px), source),
-                    (20, 125 + 30 * index),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2,
-                )
+            green, red = (0, 255, 0), (0, 0, 255)
+            for index, ((box_px, blob_px, source), candidate) in enumerate(zip(die_areas, candidates)):
+                die_label = candidate[3]
+                top = 125 + 60 * index
+                blob_text = "n/a" if blob_px is None else "{} px".format(int(blob_px))
+                cv2.putText(frame, "{} box: {} px".format(die_label, int(box_px)), (20, top),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, green if source == "box" else red, 2)
+                cv2.putText(frame, "{} blob: {}".format(die_label, blob_text), (20, top + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, green if source == "blob" else red, 2)
             
             if args.mode == "flight":
                 writer.write(frame)
