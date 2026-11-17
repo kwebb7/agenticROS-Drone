@@ -5,6 +5,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import cv2
 import torch
 from ultralytics import YOLO
@@ -78,6 +79,59 @@ def find_dice(model, image, target, conf, device):
 
     return candidates
 
+
+def die_blob_area(frame, bounds, clusters=3, work_size=64):
+    """Return the pixel area of the die's main single-color region inside its YOLO box.
+
+    No color ranges are used. The box's pixels are grouped into a few color clusters
+    (k-means in Lab space), the cluster at the center of the box is taken as the die,
+    and the outline area of its largest connected region is returned. The outline
+    fills holes, so white pips count as part of the die. Return None if the box is
+    too small to analyze. Call this on a clean frame, before anything is drawn on it.
+    """
+    x, y, width, height = bounds
+    x1, y1 = max(x, 0), max(y, 0)
+    x2, y2 = min(x + width, frame.shape[1]), min(y + height, frame.shape[0])
+    crop = frame[y1:y2, x1:x2]
+    if crop.shape[0] < 8 or crop.shape[1] < 8:
+        return None
+
+    # Cluster on a shrunken copy for speed, then stretch the labels back to full size.
+    scale = work_size / max(crop.shape[:2])
+    small = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else crop
+    lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    if len(lab) < clusters:
+        return None
+
+    cv2.setRNGSeed(0)  # same frame gives the same clusters every time
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, _ = cv2.kmeans(lab, clusters, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    labels = labels.reshape(small.shape[:2]).astype(np.uint8)
+    labels = cv2.resize(labels, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    # The box is drawn around the die, so the cluster most common in its middle half is the die.
+    rows, cols = labels.shape
+    middle = labels[rows // 4: 3 * rows // 4, cols // 4: 3 * cols // 4]
+    die_label = np.bincount(middle.ravel()).argmax()
+
+    mask = (labels == die_label).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+    contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    if not contours:
+        return 0
+    return int(cv2.contourArea(max(contours, key=cv2.contourArea)))
+
+
+def measure_die_area(frame, box_area, bounds, tolerance=1.2):
+    """Return ``(area, source)`` for one die.
+
+    Use the blob area unless it is missing, empty, or larger than ``tolerance`` times
+    the YOLO box area. In those cases return the box area. ``source`` is "blob" or "box".
+    """
+    blob = die_blob_area(frame, bounds)
+    if blob is None or blob == 0 or blob > tolerance * box_area:
+        return box_area, "box"
+    return blob, "blob"
 
 def close_resources(camera, writer):
     """Optional video resources, camera, display windows, and debug logs."""
@@ -183,12 +237,18 @@ def main():
                 continue
 
             candidates = find_dice(model, frame, args.target, args.conf, device)
+
+            die_areas = [measure_die_area(frame, box_area, bounds)
+                         for box_area, _, bounds, _, _ in candidates]
+            
             # The most confident die is the one the error and drone commands follow.
             detection = max(candidates, key=lambda candidate: candidate[4]) if candidates else None
             forward_speed, right_speed = 0.0, 0.0
             error_text = "dx: -  dy: -"
             inside = False
 
+
+            
             if detection is None:
                 x_errors.clear()
                 y_errors.clear()
@@ -250,19 +310,17 @@ def main():
             cv2.putText(frame, status, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.putText(frame, "forward: {:.2f}  right: {:.2f} m/s".format(forward_speed, right_speed), (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.putText(frame, error_text, (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if aligned else (0, 0, 255), 2)
-
-            # Pixel area of every detected die, listed under the dx/dy line.
-            for index, (die_area, _, _, die_label, _) in enumerate(candidates):
+            
+            for index, ((die_px, source), candidate) in enumerate(zip(die_areas, candidates)):
                 cv2.putText(
                     frame,
-                    "{} area: {} px".format(die_label, int(die_area)),
+                    "{} area: {} px ({})".format(candidate[3], int(die_px), source),
                     (20, 125 + 30 * index),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (0, 0, 255),
                     2,
                 )
-
             
             if args.mode == "flight":
                 writer.write(frame)
